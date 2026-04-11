@@ -1,7 +1,8 @@
 /target
 
-# Claude Code project state
-.claude/
+# Claude Code local-only state (settings.json is committed, local overrides are not)
+.claude/*.local.json
+.claude/*.local.md
 
 # Devenv
 .devenv*

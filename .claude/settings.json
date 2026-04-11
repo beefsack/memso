@@ -1,0 +1,10 @@
+{
+  "extraKnownMarketplaces": {
+    "memso": {
+      "source": {
+        "source": "github",
+        "repo": "beefsack/memso"
+      }
+    }
+  }
+}
