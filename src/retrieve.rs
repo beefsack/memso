@@ -111,7 +111,8 @@ pub async fn search(
 ) -> Result<Vec<CompactResult>> {
     let blob = embed::floats_to_blob(&embedding);
 
-    // Stream A: vector search
+    // Stream A: vector search (filtered to current model only; memories lacking a
+    // current-model vector gracefully fall through to BM25 during re-embedding).
     let mut vector_ranks: HashMap<String, usize> = HashMap::new();
     {
         let mut rows = conn
@@ -119,10 +120,10 @@ pub async fn search(
                 "SELECT m.id
                  FROM memories m
                  JOIN memory_vectors v ON v.memory_id = m.id
-                 WHERE m.project_id = ?1 AND m.status = 'active'
-                 ORDER BY vector_distance_cos(v.embedding, vector32(?2))
-                 LIMIT ?3",
-                params![project_id.to_string(), blob, (limit * 2) as i64],
+                 WHERE m.project_id = ?1 AND m.status = 'active' AND v.embed_model = ?2
+                 ORDER BY vector_distance_cos(v.embedding, vector32(?3))
+                 LIMIT ?4",
+                params![project_id.to_string(), embed::model_id(), blob, (limit * 2) as i64],
             )
             .await?;
         let mut rank = 0usize;

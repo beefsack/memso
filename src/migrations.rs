@@ -1,6 +1,8 @@
 use anyhow::Result;
 use libsql::Connection;
 
+use crate::embed;
+
 pub async fn run(conn: &Connection) -> Result<()> {
     // Base schema: all CREATE TABLE/INDEX/TRIGGER statements are idempotent.
     conn.execute_batch(SCHEMA).await?;
@@ -17,8 +19,38 @@ pub async fn run(conn: &Connection) -> Result<()> {
         set_version(conn, 1).await?;
     }
 
-    // Add future migrations here:
-    // if version < 2 { ... set_version(conn, 2).await?; }
+    // v1 -> v2: add embed_model column to memory_vectors.
+    // Databases created after this change already have the column (from the base SCHEMA);
+    // the PRAGMA check makes the ALTER TABLE idempotent for both old and new databases.
+    // Existing rows are backfilled with the current model_id so they are treated as
+    // up-to-date and are not queued for re-embedding.
+    if version < 2 {
+        let mut rows = conn
+            .query("PRAGMA table_info(memory_vectors)", libsql::params![])
+            .await?;
+        let mut has_col = false;
+        while let Some(row) = rows.next().await? {
+            let name: String = row.get(1)?;
+            if name == "embed_model" {
+                has_col = true;
+                break;
+            }
+        }
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE memory_vectors ADD COLUMN embed_model TEXT NOT NULL DEFAULT ''",
+                libsql::params![],
+            )
+            .await?;
+        }
+        // Backfill rows that were created before this migration.
+        conn.execute(
+            "UPDATE memory_vectors SET embed_model = ?1 WHERE embed_model = ''",
+            libsql::params![embed::model_id()],
+        )
+        .await?;
+        set_version(conn, 2).await?;
+    }
 
     Ok(())
 }
@@ -90,8 +122,9 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE TABLE IF NOT EXISTS memory_vectors (
-    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    embedding F32_BLOB(384) NOT NULL
+    memory_id   TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    embed_model TEXT NOT NULL DEFAULT '',
+    embedding   F32_BLOB(384) NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS memory_vectors_idx
