@@ -35,10 +35,15 @@ pub async fn enable(
         .context("Failed to checkpoint WAL")?;
 
     println!("[3/6] Connecting to remote at {} ...", url);
-    let remote_db = Builder::new_remote(url.clone(), token)
-        .build()
-        .await
-        .context("Failed to connect to remote - check the URL and token")?;
+    let remote_db = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        Builder::new_remote(url.clone(), token).build(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(
+        "Timed out connecting to remote at {url} (10s). Check the URL and token."
+    ))
+    .and_then(|r| r.context("Failed to connect to remote - check the URL and token"))?;
     let remote = remote_db.connect().context("Failed to connect to remote DB")?;
 
     println!("[4/6] Running migrations on remote database ...");
@@ -106,10 +111,15 @@ pub async fn sync(config: &Config, force: bool) -> Result<String> {
     }
 
     println!("Connecting to remote at {} ...", url);
-    let remote_db = Builder::new_remote(url.to_string(), token.to_string())
-        .build()
-        .await
-        .context("Failed to connect to remote DB")?;
+    let remote_db = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        Builder::new_remote(url.to_string(), token.to_string()).build(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(
+        "Timed out connecting to remote at {url} (10s). Check the URL and token."
+    ))
+    .and_then(|r| r.context("Failed to connect to remote DB"))?;
     let remote = remote_db.connect()?;
 
     println!("Running migrations on remote database ...");

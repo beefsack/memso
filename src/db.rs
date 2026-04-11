@@ -34,7 +34,17 @@ impl Db {
                     .as_deref()
                     .context("replica mode requires backend.auth_token")?;
                 let path_str = path.to_str().context("replica DB path is not valid UTF-8")?;
-                open_replica_with_recovery(path_str, path.as_ref(), url, token).await?
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    open_replica_with_recovery(path_str, path.as_ref(), url, token),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!(
+                        "Timed out connecting to remote database at {url} (10s). \
+                         Check remote_url and auth_token in .memso.toml."
+                    ))
+                })?
             }
         };
 
