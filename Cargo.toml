@@ -47,7 +47,6 @@ serde_with = { version = "2", features = ["macros", "json"] }
 
 # Secret sanitization
 regex = "1"
-once_cell = "1"
 
 # Error handling
 anyhow = "1"
@@ -60,6 +59,9 @@ hex = "0.4"
 
 # XDG/platform config and cache directories
 dirs = "6"
+
+# Shell-style env var expansion in config values ($VAR, ${VAR}, ${VAR:-default})
+shellexpand = "3"
 
 
 [profile.release]
