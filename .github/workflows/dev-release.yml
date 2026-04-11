@@ -1,0 +1,92 @@
+name: Dev Release
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: memso-linux-x86_64.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: memso-linux-aarch64.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: memso-macos-aarch64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: memso-windows-x86_64.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dev-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: tar czf ${{ matrix.artifact }} -C target/${{ matrix.target }}/release memso
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path target\${{ matrix.target }}\release\memso.exe -DestinationPath ${{ matrix.artifact }}
+
+      - name: Ensure dev release exists
+        # The || true handles the race where multiple parallel jobs all try to create
+        # the release at the same time - only one succeeds, the rest fail silently.
+        run: |
+          gh release view dev --repo ${{ github.repository }} \
+            || gh release create dev \
+                 --prerelease \
+                 --title "Dev builds (main branch)" \
+                 --notes "Automatically updated on every push to main. Install via \`/plugin install memso-dev\` in Claude Code." \
+                 --repo ${{ github.repository }} \
+            || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifact
+        run: gh release upload dev ${{ matrix.artifact }} --clobber --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Runs after all build jobs so dev-version.txt is only updated once all
+  # platform binaries are in place. The dev bootstrap reads this file first
+  # and uses the SHA as a freshness signal - updating it last ensures
+  # a consistent release is always available when the SHA changes.
+  publish-version:
+    name: Publish dev-version.txt
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Write commit SHA
+        run: printf '%s' "${{ github.sha }}" > dev-version.txt
+
+      - name: Upload dev-version.txt
+        run: gh release upload dev dev-version.txt --clobber --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
