@@ -32,6 +32,7 @@ if [[ -n "${MEMSO_BINARY_OVERRIDE:-}" ]]; then
   cp -f "${MEMSO_BINARY_OVERRIDE}" "${BINARY}"
   chmod +x "${BINARY}"
   printf '%s' "${COMPOSITE}" > "${VERSION_FILE}"
+  echo "[memso bootstrap] Binary ready (dev override: ${MEMSO_BINARY_OVERRIDE})"
   exit 0
 fi
 
@@ -71,6 +72,7 @@ if [[ -f "${VERSION_FILE}" ]]; then
 
   if [[ "${installed}" == "${COMPOSITE}" ]]; then
     # Already up to date.
+    echo "[memso bootstrap] Binary ready (v${COMPOSITE})"
     exit 0
   fi
 
@@ -78,6 +80,7 @@ if [[ -f "${VERSION_FILE}" ]]; then
   if [[ "${installed_memso}" == "${MEMSO_VERSION}" && -f "${BINARY}" ]]; then
     # Only the plugin revision changed - no binary download needed.
     printf '%s' "${COMPOSITE}" > "${VERSION_FILE}"
+    echo "[memso bootstrap] Binary ready (v${COMPOSITE})"
     exit 0
   fi
 fi
@@ -109,3 +112,4 @@ esac
 printf '%s' "${COMPOSITE}" > "${VERSION_FILE}"
 
 echo "[memso] Installed v${COMPOSITE} to ${BINARY}" >&2
+echo "[memso bootstrap] Downloaded and installed v${COMPOSITE} (${OS}/${ARCH})"

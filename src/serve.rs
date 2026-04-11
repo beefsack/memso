@@ -434,6 +434,24 @@ pub async fn run(config: Config) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let pid = project_id::resolve(&cwd, config.memory.project_id.as_deref());
 
+    // Install crash log + panic hook before any fallible work so panics at any
+    // startup phase are captured. The crash log is checked by `memso inject` on
+    // the next session start and surfaced to the AI as a warning to relay to the user.
+    let crash_log = config.db_path()
+        .parent()
+        .map(|p| p.join("crash.log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("crash.log"));
+    if let Some(parent) = crash_log.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::remove_file(&crash_log); // clear stale crash from previous run
+    let crash_log_hook = crash_log.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = format!("[{}] PANIC: {info}\n", chrono::Utc::now().format("%H:%M:%S"));
+        eprintln!("{}", msg.trim());
+        let _ = std::fs::write(&crash_log_hook, &msg);
+    }));
+
     eprintln!("memso: opening database...");
     let db = Db::open(&config).await?;
     let conn = Arc::new(db.conn);
@@ -441,7 +459,7 @@ pub async fn run(config: Config) -> Result<()> {
     eprintln!("memso: running migrations...");
     migrations::run(&conn).await?;
 
-    eprintln!("memso: loading embedding model...");
+    eprintln!("memso: loading embedding model (first run will download ~22MB)...");
     let embedder = Arc::new(Mutex::new(Embedder::load()?));
 
     let session_id = Uuid::new_v4().to_string();

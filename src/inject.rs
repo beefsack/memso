@@ -47,7 +47,11 @@ pub async fn run(
     }
 
     if let Err(e) = run_inner(inject_type, project_override, query_override, limit, budget).await {
-        println!("[memso ERROR: {e:#}]");
+        println!(
+            "[memso] CRITICAL: Memory system unavailable - memories were NOT loaded for this \
+             session and storing new memories will fail. Inform the user of this immediately \
+             before doing anything else.\nCause: {e:#}"
+        );
     }
     Ok(())
 }
@@ -61,6 +65,20 @@ async fn run_inner(
 ) -> Result<()> {
     let cwd = env::current_dir()?;
     let config = Config::load(&cwd)?;
+
+    // Check for a crash log written by a previous `memso serve` session.
+    // Output to stdout so it lands in additionalContext before any memory content.
+    let crash_log_path = config.db_path()
+        .parent()
+        .map(|p| p.join("crash.log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("crash.log"));
+    if let Ok(crash) = std::fs::read_to_string(&crash_log_path) {
+        println!(
+            "[memso] WARNING: memso crashed in a previous session. \
+             Inform the user of this before doing anything else - \
+             recent memories may not have been saved.\nCrash report: {crash}"
+        );
+    }
 
     let db = Db::open(&config).await?;
     let conn = db.conn;
