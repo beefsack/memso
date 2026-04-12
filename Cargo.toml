@@ -9,8 +9,19 @@ description = "Local-first persistent memory for AI agents, backed by libSQL and
 # MCP stdio transport
 rmcp = { version = "1", features = ["server", "transport-io"] }
 
-# Database - embedded SQLite replica with Turso sync
-libsql = "0.9"
+# Database - embedded SQLite with Turso sync for remote/replica mode.
+# sync feature uses hyper-tls -> native-tls -> OpenSSL on Linux.
+# OpenSSL is acceptable here; static linking via the vendored feature is used
+# in release builds so users get a self-contained binary.
+turso = { version = "0.5.3", features = ["sync"] }
+# turso_core: direct dep to enable the fts (Tantivy) feature.
+# turso's public API does not expose fts, so we add turso_core directly.
+# Cargo feature unification ensures turso_core compiles with fts enabled,
+# registering the FTS index method for USING fts DDL in local mode.
+turso_core = { version = "0.5.3", features = ["fts"] }
+# Static OpenSSL for portable release binaries (no libssl.so dependency at runtime).
+# The vendored feature compiles OpenSSL from source during cargo build.
+openssl = { version = "0.10", features = ["vendored"] }
 
 # Local ONNX embeddings (bge-small-en-v1.5)
 fastembed = { version = "5", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }

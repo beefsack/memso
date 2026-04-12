@@ -83,10 +83,10 @@ async fn main() -> Result<()> {
         }
         Command::Remote { subcommand } => {
             let cwd = std::env::current_dir()?;
-            let config = Config::load(&cwd)?;
+            let mut config = Config::load(&cwd)?;
             match subcommand {
                 RemoteCommand::Enable { url, token, force } => {
-                    remote::enable(&config, url, token, force).await?;
+                    remote::enable(&mut config, url, token, force).await?;
                 }
                 RemoteCommand::Sync { force } => {
                     let msg = remote::sync(&config, force).await?;

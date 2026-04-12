@@ -33,15 +33,15 @@ use crate::{
 
 /// Database connection and embedding model, available once background init completes.
 struct DbReady {
-    conn: Arc<libsql::Connection>,
+    conn: Arc<turso::Connection>,
     embedder: Arc<Mutex<Embedder>>,
 }
 
 /// State of the database for two-phase startup.
 #[derive(Clone)]
 enum DbState {
-    /// Background init (replica sync + embedder load) still in progress.
-    Syncing,
+    /// Background init (DB open, migrations, embedder load) still in progress.
+    Initializing,
     /// Ready — tools may proceed.
     Ready(Arc<DbReady>),
     /// Init failed permanently; all tool calls return this error.
@@ -64,8 +64,8 @@ impl MemsoServer {
     /// Call at the top of every tool handler that needs the DB or embedder.
     fn try_ready(&self) -> Result<Arc<DbReady>, String> {
         match &*self.db.borrow() {
-            DbState::Syncing => Err(
-                "memso is syncing the memory database locally (initial replication). \
+            DbState::Initializing => Err(
+                "memso is initializing (opening database and loading models). \
                  Please wait a moment and retry."
                     .to_string(),
             ),
@@ -398,7 +398,7 @@ impl MemsoServer {
             .execute(
                 "INSERT INTO raw_captures (id, project_id, captured_at, tool_name, summary, raw_data) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                libsql::params![id, self.project_id.clone(), now, input.context, input.summary.clone(), input.summary.clone()],
+                turso::params![id, self.project_id.clone(), now, input.context, input.summary.clone(), input.summary.clone()],
             )
             .await
             .map(|_| format!("Staged note: {}", input.summary))
@@ -497,14 +497,20 @@ pub async fn run(config: Config) -> Result<()> {
     if let Err(ref e) = result {
         let msg = format!("[{}] ERROR: {e:#}\n", chrono::Utc::now().format("%H:%M:%S"));
         eprintln!("{}", msg.trim());
-        let _ = std::fs::write(&crash_log, &msg);
+        // Append rather than overwrite: the panic hook may have already written to
+        // crash.log (it runs before we get here), and we don't want to erase it.
+        use std::io::Write as _;
+        let _ = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open(&crash_log)
+            .and_then(|mut f| writeln!(f, "{}", msg.trim()));
     }
     result
 }
 
 async fn serve_inner(config: Config, project_id: String) -> Result<()> {
     // Set up the watch channel: None = syncing, Some = ready or failed.
-    let (db_tx, db_rx) = tokio::sync::watch::channel(DbState::Syncing);
+    let (db_tx, db_rx) = tokio::sync::watch::channel(DbState::Initializing);
     let mut db_rx_monitor = db_rx.clone();
 
     // Acquire an exclusive lock on serve.lock for this process's entire lifetime.
@@ -567,9 +573,11 @@ async fn serve_inner(config: Config, project_id: String) -> Result<()> {
         _ = wait_db_failed(&mut db_rx_monitor) => {
             let msg = match &*db_rx_monitor.borrow() {
                 DbState::Failed(msg) => msg.clone(),
-                // Sender dropped without sending Failed — likely a panic in the init task.
-                // The panic hook will have written a more detailed message to crash.log.
-                _ => "background init task exited unexpectedly (possible panic — check crash.log)".to_string(),
+                // Sender dropped while still Syncing: the init task panicked before
+                // completing. The panic hook will have written details to crash.log.
+                DbState::Initializing => "init task panicked before completing (check crash.log)".to_string(),
+                // Ready is unreachable: wait_db_failed never resolves in that state.
+                DbState::Ready(_) => unreachable!("wait_db_failed does not return when state is Ready"),
             };
             Err(anyhow::anyhow!("Database init failed: {msg}"))
         }
@@ -581,14 +589,26 @@ async fn serve_inner(config: Config, project_id: String) -> Result<()> {
     serve_result
 }
 
-/// Resolves once the DB state transitions to [`DbState::Failed`].
+/// Resolves once the DB state transitions to [`DbState::Failed`], or if the
+/// background init task exits before reaching [`DbState::Ready`] (panic case).
+///
+/// Does NOT resolve when init succeeds: after a successful init the sender is
+/// dropped with state=Ready, and we must not trigger the failure arm in that case.
 async fn wait_db_failed(rx: &mut tokio::sync::watch::Receiver<DbState>) {
     loop {
-        if matches!(&*rx.borrow(), DbState::Failed(_)) {
-            return;
+        match &*rx.borrow() {
+            DbState::Failed(_) => return,
+            // Init succeeded — never resolve so the select doesn't pick this arm.
+            DbState::Ready(_) => std::future::pending::<()>().await,
+            DbState::Initializing => {}
         }
         if rx.changed().await.is_err() {
-            return; // sender dropped — shouldn't happen in normal operation
+            // Sender dropped. If state is now Ready, init succeeded — park forever.
+            // If state is still Syncing, the task panicked before completing — trigger.
+            if matches!(&*rx.borrow(), DbState::Ready(_)) {
+                std::future::pending::<()>().await;
+            }
+            return;
         }
     }
 }

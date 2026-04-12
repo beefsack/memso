@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
-use libsql::{params, params_from_iter};
+use turso::{params, params_from_iter};
 use std::collections::HashMap;
 
 use crate::embed;
@@ -103,15 +103,15 @@ pub struct FullMemory {
 /// `embedding` must be pre-computed by the caller before any locks are held,
 /// so the embedding step does not block concurrent tool calls.
 pub async fn search(
-    conn: &libsql::Connection,
+    conn: &turso::Connection,
     embedding: Vec<f32>,
     query: &str,
     project_id: &str,
     limit: usize,
 ) -> Result<Vec<CompactResult>> {
-    let blob = embed::floats_to_blob(&embedding);
+    let json = embed::floats_to_json(&embedding);
 
-    // Stream A: vector search
+    // Stream A: vector search (full table scan - turso has no ANN index yet)
     let mut vector_ranks: HashMap<String, usize> = HashMap::new();
     {
         let mut rows = conn
@@ -122,7 +122,7 @@ pub async fn search(
                  WHERE m.project_id = ?1 AND m.status = 'active'
                  ORDER BY vector_distance_cos(v.embedding, vector32(?2))
                  LIMIT ?3",
-                params![project_id.to_string(), blob, (limit * 2) as i64],
+                params![project_id.to_string(), json, (limit * 2) as i64],
             )
             .await?;
         let mut rank = 0usize;
@@ -133,28 +133,29 @@ pub async fn search(
         }
     }
 
-    // Stream B: BM25 full-text search
+    // Stream B: BM25 full-text search via turso native FTS
     let mut bm25_ranks: HashMap<String, usize> = HashMap::new();
     {
         let fts_query = build_fts_query(query);
-        let mut rows = conn
-            .query(
-                "SELECT m.id
-                 FROM memories m
-                 JOIN memories_fts ON memories_fts.rowid = m.rowid
-                 WHERE memories_fts MATCH ?1
-                   AND m.project_id = ?2
-                   AND m.status = 'active'
-                 ORDER BY bm25(memories_fts)
-                 LIMIT ?3",
-                params![fts_query, project_id.to_string(), (limit * 2) as i64],
-            )
-            .await?;
-        let mut rank = 0usize;
-        while let Some(row) = rows.next().await? {
-            let id: String = row.get(0)?;
-            bm25_ranks.insert(id, rank);
-            rank += 1;
+        if !fts_query.is_empty() {
+            let mut rows = conn
+                .query(
+                    "SELECT m.id
+                     FROM memories m
+                     WHERE fts_match(m.title, m.content, m.facts, ?1)
+                       AND m.project_id = ?2
+                       AND m.status = 'active'
+                     ORDER BY fts_score(m.title, m.content, m.facts, ?1) DESC
+                     LIMIT ?3",
+                    params![fts_query.clone(), project_id.to_string(), (limit * 2) as i64],
+                )
+                .await?;
+            let mut rank = 0usize;
+            while let Some(row) = rows.next().await? {
+                let id: String = row.get(0)?;
+                bm25_ranks.insert(id, rank);
+                rank += 1;
+            }
         }
     }
 
@@ -236,7 +237,7 @@ pub async fn search(
 /// Fetch multiple memories in a single query. Returns only found memories;
 /// callers can detect missing IDs by comparing against the input set.
 pub async fn get_full_batch(
-    conn: &libsql::Connection,
+    conn: &turso::Connection,
     ids: &[String],
 ) -> Result<Vec<FullMemory>> {
     if ids.is_empty() {
@@ -276,8 +277,8 @@ pub async fn get_full_batch(
         "UPDATE memories SET access_count = access_count + 1, last_accessed = ? \
          WHERE id IN ({placeholders})"
     );
-    let update_params: Vec<libsql::Value> = std::iter::once(libsql::Value::Text(Utc::now().to_rfc3339()))
-        .chain(ids.iter().cloned().map(libsql::Value::Text))
+    let update_params: Vec<turso::Value> = std::iter::once(turso::Value::Text(Utc::now().to_rfc3339()))
+        .chain(ids.iter().cloned().map(turso::Value::Text))
         .collect();
     let _ = conn.execute(&update_sql, params_from_iter(update_params)).await;
 
@@ -285,7 +286,7 @@ pub async fn get_full_batch(
 }
 
 /// Pin or unpin a batch of memories in a single query. Returns the number of rows updated.
-pub async fn pin_batch(conn: &libsql::Connection, ids: &[String], pin: bool) -> Result<u64> {
+pub async fn pin_batch(conn: &turso::Connection, ids: &[String], pin: bool) -> Result<u64> {
     if ids.is_empty() {
         return Ok(0);
     }
@@ -293,14 +294,14 @@ pub async fn pin_batch(conn: &libsql::Connection, ids: &[String], pin: bool) -> 
     let sql = format!(
         "UPDATE memories SET pinned = ? WHERE id IN ({placeholders}) AND status != 'deleted'"
     );
-    let params: Vec<libsql::Value> = std::iter::once(libsql::Value::Integer(if pin { 1 } else { 0 }))
-        .chain(ids.iter().cloned().map(libsql::Value::Text))
+    let params: Vec<turso::Value> = std::iter::once(turso::Value::Integer(if pin { 1 } else { 0 }))
+        .chain(ids.iter().cloned().map(turso::Value::Text))
         .collect();
     Ok(conn.execute(&sql, params_from_iter(params)).await?)
 }
 
 /// Soft-delete a batch of memories in a single query. Returns the number of rows updated.
-pub async fn delete_batch(conn: &libsql::Connection, ids: &[String]) -> Result<u64> {
+pub async fn delete_batch(conn: &turso::Connection, ids: &[String]) -> Result<u64> {
     if ids.is_empty() {
         return Ok(0);
     }
@@ -312,23 +313,25 @@ pub async fn delete_batch(conn: &libsql::Connection, ids: &[String]) -> Result<u
 /// BM25-only search: no embedding required. Used by inject --type prompt to avoid
 /// loading the ONNX model on every UserPromptSubmit hook invocation.
 pub async fn search_bm25(
-    conn: &libsql::Connection,
+    conn: &turso::Connection,
     query: &str,
     project_id: &str,
     limit: usize,
 ) -> Result<Vec<CompactResult>> {
     let now = Utc::now();
     let fts_query = build_fts_query(query);
+    if fts_query.is_empty() {
+        return Ok(vec![]);
+    }
     let mut rows = conn
         .query(
             "SELECT m.id, m.type, m.title, m.created_at, m.importance,
                     m.access_count, m.last_accessed, m.source, length(m.content), m.facts, m.tags
              FROM memories m
-             JOIN memories_fts ON memories_fts.rowid = m.rowid
-             WHERE memories_fts MATCH ?1
+             WHERE fts_match(m.title, m.content, m.facts, ?1)
                AND m.project_id = ?2
                AND m.status = 'active'
-             ORDER BY bm25(memories_fts)
+             ORDER BY fts_score(m.title, m.content, m.facts, ?1) DESC
              LIMIT ?3",
             params![fts_query, project_id.to_string(), limit as i64],
         )
@@ -373,7 +376,7 @@ pub async fn search_bm25(
 }
 
 pub async fn list(
-    conn: &libsql::Connection,
+    conn: &turso::Connection,
     project_id: &str,
     filter_type: Option<&str>,
     filter_tags: &[String],
@@ -455,19 +458,17 @@ pub async fn list(
 }
 
 fn build_fts_query(query: &str) -> String {
-    // FTS5 tokens may only contain alphanumerics and underscores.
-    // Strip other characters (e.g. "." in "install.rs") to avoid syntax errors.
-    //
-    // Each token is wrapped in double quotes before the "*" suffix: `"token"*`
-    // This is required because FTS5 treats bare words like "and", "or", "not", "near"
-    // as query operators, producing a syntax error when followed by "*".
-    // Quoting a single term (`"token"*`) is valid FTS5 prefix-phrase syntax and
-    // is semantically identical to `token*` for non-reserved words.
+    // Turso FTS uses Tantivy query syntax via fts_match(cols, query).
+    // Strip non-alphanumeric characters to avoid syntax errors.
+    // Tantivy operators (AND, OR, NOT) are uppercase-only, so lowercase
+    // tokens are always treated as terms even if they spell operator names.
+    // Returns empty string when no valid tokens are found; callers skip the
+    // FTS search in that case.
     query
         .split_whitespace()
         .filter_map(|w| {
             let clean: String = w.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
-            if clean.is_empty() { None } else { Some(format!("\"{clean}\"*")) }
+            if clean.is_empty() { None } else { Some(clean.to_lowercase()) }
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -511,8 +512,8 @@ mod tests {
     }
 
     #[test]
-    fn build_fts_query_appends_wildcards() {
-        assert_eq!(build_fts_query("hello world"), "\"hello\"* \"world\"*");
+    fn build_fts_query_lowercases_tokens() {
+        assert_eq!(build_fts_query("Hello World"), "hello world");
     }
 
     #[test]
@@ -522,20 +523,20 @@ mod tests {
 
     #[test]
     fn build_fts_query_strips_dots() {
-        // "install.rs" -> "\"installrs\"*", "settings.json" -> "\"settingsjson\"*"
-        assert_eq!(build_fts_query("install.rs settings.json"), "\"installrs\"* \"settingsjson\"*");
+        // "install.rs" -> "installrs", "settings.json" -> "settingsjson"
+        assert_eq!(build_fts_query("install.rs settings.json"), "installrs settingsjson");
     }
 
     #[test]
     fn build_fts_query_drops_punctuation_only_tokens() {
-        assert_eq!(build_fts_query("hello ... world"), "\"hello\"* \"world\"*");
+        assert_eq!(build_fts_query("hello ... world"), "hello world");
     }
 
     #[test]
-    fn build_fts_query_quotes_reserved_words() {
-        // "and", "or", "not", "near" are FTS5 operators; quoting prevents syntax errors.
-        assert_eq!(build_fts_query("hello and world"), "\"hello\"* \"and\"* \"world\"*");
-        assert_eq!(build_fts_query("not this"), "\"not\"* \"this\"*");
+    fn build_fts_query_lowercases_potential_operators() {
+        // Tantivy operators are uppercase-only; lowercase AND/OR/NOT are plain terms.
+        assert_eq!(build_fts_query("hello AND world"), "hello and world");
+        assert_eq!(build_fts_query("NOT this"), "not this");
     }
 }
 

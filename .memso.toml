@@ -1,3 +1,4 @@
 [backend]
-mode = "replica"
-remote_url = "libsql://memory-memso-beefsack.aws-ap-northeast-1.turso.io"
+mode = "local"
+# remote_url = "libsql://memory-memso-beefsack.aws-ap-northeast-1.turso.io"
+# Switch back to replica mode once turso sync is validated

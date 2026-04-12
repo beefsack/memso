@@ -11,6 +11,9 @@
     act
     cargo-outdated
     gh
+    openssl
+    pkg-config
+    python3
     sqld
     turso-cli
     upx

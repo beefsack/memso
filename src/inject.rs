@@ -23,28 +23,29 @@ search_memory(query,[limit,detail]) | get_memories(ids) | \
 list_memories([type,tags,limit,detail]) | capture_note(summary,[context]) | \
 pin_memories(ids,pin) | delete_memories(ids)\n";
 
-/// Returns true if `memso serve` is running but has not yet finished syncing.
+/// Returns true if `memso serve` is running (initializing or fully ready).
 ///
-/// Detection: try a non-blocking exclusive lock on `serve.lock`. The OS holds
-/// that lock for `serve`'s entire lifetime and releases it automatically on any
-/// exit — there are no stale files to worry about.
-fn is_serve_syncing(config: &Config) -> bool {
+/// When serve is running it holds an exclusive OS flock on `serve.lock` for its
+/// entire lifetime. inject must not attempt Db::open while serve holds that lock
+/// because turso uses exclusive file locking — two processes cannot open the same
+/// DB simultaneously.
+///
+/// Detection order:
+///   1. `serve.ready` exists → serve is fully up (fast path, no lock probe needed).
+///   2. Try a non-blocking exclusive lock on `serve.lock` → if we cannot acquire it,
+///      another process holds it (serve is running but still initializing).
+fn is_serve_running(config: &Config) -> bool {
     use fs4::fs_std::FileExt;
     if config.serve_ready_path().exists() {
-        return false; // already ready — no need to check lock
+        return true; // serve is fully up
     }
     let lock_path = config.serve_lock_path();
     let Ok(file) = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&lock_path) else {
         return false;
     };
-    // try_lock_exclusive returns Ok(true) if we got the lock (no server running),
-    // Ok(false) if another process holds it (server is running and still syncing).
     match file.try_lock_exclusive() {
-        Ok(true) => {
-            let _ = file.unlock();
-            false
-        }
-        Ok(false) => true,
+        Ok(true) => { let _ = file.unlock(); false } // acquired → no serve running
+        Ok(false) => true,                           // held by serve (still initializing)
         Err(_) => false,
     }
 }
@@ -106,14 +107,22 @@ async fn run_inner(
         );
     }
 
-    // If `memso serve` is running but not yet ready (initial replica sync in progress),
-    // return a helpful message immediately instead of racing with the server on Db::open.
-    if is_serve_syncing(&config) {
-        println!(
-            "[memso] memso is syncing the memory database locally (initial replication). \
-             Memories are not yet available. Once sync completes the memory index will \
-             load automatically on your next prompt."
-        );
+    // If `memso serve` is running (initializing or ready), skip direct DB access.
+    // serve holds an exclusive turso file lock; two processes cannot open the same DB.
+    // When the MCP server is up, memory tools (search_memory, store_memories, etc.)
+    // are available directly — inject just emits instructions in that case.
+    // When serve is still initializing, memories will be available once it is ready.
+    if is_serve_running(&config) {
+        // serve holds an exclusive turso file lock; skip Db::open to avoid conflict.
+        // Session/compact: remind Claude that memory tools are available via MCP.
+        // Prompt: no output needed — session hook already provided INSTRUCTIONS.
+        if inject_type == "session" || inject_type == "compact" {
+            println!(
+                "{INSTRUCTIONS}\
+                 [memso] MCP server is running — memory context is available via tools. \
+                 Use search_memory / list_memories for context retrieval this session."
+            );
+        }
         return Ok(());
     }
 
@@ -137,7 +146,7 @@ async fn run_inner(
 // Prompt injection is best-effort context; keyword relevance is sufficient here.
 // Full hybrid search is reserved for session-start where latency tolerance is higher.
 async fn run_prompt(
-    conn: &libsql::Connection,
+    conn: &turso::Connection,
     query: &str,
     project_id: &str,
     limit: usize,
@@ -190,7 +199,7 @@ fn is_stop_hook_active() -> bool {
 const FULL_CONTENT_BUDGET: usize = 30_000;
 
 async fn run_session(
-    conn: &libsql::Connection,
+    conn: &turso::Connection,
     project_id: &str,
     budget: usize,
 ) -> Result<()> {
@@ -260,7 +269,7 @@ struct PendingCapture {
 }
 
 async fn query_pending_captures(
-    conn: &libsql::Connection,
+    conn: &turso::Connection,
     project_id: &str,
 ) -> Result<Vec<PendingCapture>> {
     let mut rows = conn
@@ -269,7 +278,7 @@ async fn query_pending_captures(
              FROM raw_captures \
              WHERE project_id = ?1 AND presented_at IS NULL \
              ORDER BY captured_at ASC",
-            libsql::params![project_id.to_string()],
+            turso::params![project_id.to_string()],
         )
         .await?;
 
@@ -284,12 +293,12 @@ async fn query_pending_captures(
     Ok(captures)
 }
 
-async fn mark_captures_presented(conn: &libsql::Connection, project_id: &str) -> Result<()> {
+async fn mark_captures_presented(conn: &turso::Connection, project_id: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     conn.execute(
         "UPDATE raw_captures SET presented_at = ?1 \
          WHERE project_id = ?2 AND presented_at IS NULL",
-        libsql::params![now, project_id.to_string()],
+        turso::params![now, project_id.to_string()],
     )
     .await?;
     Ok(())

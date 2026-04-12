@@ -10,7 +10,7 @@ async fn insert_raw(db: &TestDb, id: &str, title: &str) {
             "INSERT INTO memories \
              (id, project_id, type, title, content, created_at, updated_at, content_hash) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            libsql::params![
+            turso::params![
                 id.to_string(),
                 "test-project".to_string(),
                 "fact".to_string(),
@@ -26,13 +26,17 @@ async fn insert_raw(db: &TestDb, id: &str, title: &str) {
 }
 
 struct TestDb {
-    pub conn: libsql::Connection,
+    pub conn: turso::Connection,
     // Keep _db alive: dropping it destroys the in-memory database.
-    _db: libsql::Database,
+    _db: turso::Database,
 }
 
 async fn migrated_db() -> TestDb {
-    let db = libsql::Builder::new_local(":memory:").build().await.unwrap();
+    let db = turso::Builder::new_local(":memory:")
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
     let conn = db.connect().unwrap();
     migrations::run(&conn).await.unwrap();
     TestDb { conn, _db: db }

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use libsql::params;
+use turso::params;
 
 use crate::{config::Config, db::Db, migrations, project_id};
 

@@ -33,10 +33,18 @@ impl Embedder {
     }
 }
 
-/// Encode a float slice as a little-endian byte blob for libsql vector storage.
-/// Shared by store and retrieve to avoid duplication.
-pub fn floats_to_blob(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+/// Encode a float slice as a JSON array string for turso vector32() input.
+/// turso's vector32() function accepts '[1.0, 2.0, ...]' and encodes it
+/// internally as a float32 blob.
+pub fn floats_to_json(v: &[f32]) -> String {
+    let mut s = String::with_capacity(v.len() * 8 + 2);
+    s.push('[');
+    for (i, f) in v.iter().enumerate() {
+        if i > 0 { s.push(','); }
+        s.push_str(&f.to_string());
+    }
+    s.push(']');
+    s
 }
 
 #[cfg(test)]
@@ -44,14 +52,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn floats_to_blob_roundtrip() {
+    fn floats_to_json_format() {
         let floats = vec![1.0f32, 2.0f32, -3.5f32];
-        let blob = floats_to_blob(&floats);
-        assert_eq!(blob.len(), 12); // 3 floats * 4 bytes each
-        let decoded: Vec<f32> = blob
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        assert_eq!(decoded, floats);
+        let json = floats_to_json(&floats);
+        assert_eq!(json, "[1,2,-3.5]");
     }
 }

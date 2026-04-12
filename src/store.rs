@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
-use libsql::params;
+use turso::params;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -44,7 +44,7 @@ pub fn new_write_lock() -> WriteLock {
 /// `embedding` must be pre-computed by the caller before acquiring any locks,
 /// so the (potentially slow) embedding step does not block concurrent tool calls.
 pub async fn store_memory(
-    conn: &libsql::Connection,
+    conn: &turso::Connection,
     embedding: Vec<f32>,
     lock: &WriteLock,
     req: StoreRequest,
@@ -58,7 +58,7 @@ pub async fn store_memory(
     let now_str = now.to_rfc3339();
 
     let importance = req.importance.unwrap_or(0.5) as f64;
-    let embedding_blob = embed::floats_to_blob(&embedding);
+    let embedding_json = embed::floats_to_json(&embedding);
 
     let tags_json = serde_json::to_string(&req.tags)?;
     let facts_json = if req.facts.is_empty() {
@@ -127,8 +127,8 @@ pub async fn store_memory(
             conn.execute("DELETE FROM memory_vectors WHERE memory_id = ?1", params![id.clone()])
                 .await?;
             conn.execute(
-                "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
-                params![id.clone(), embedding_blob],
+                "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, vector32(?2))",
+                params![id.clone(), embedding_json.clone()],
             )
             .await?;
 
@@ -154,8 +154,8 @@ pub async fn store_memory(
     .await?;
 
     conn.execute(
-        "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
-        params![id.clone(), embedding_blob],
+        "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, vector32(?2))",
+        params![id.clone(), embedding_json],
     )
     .await?;
 
